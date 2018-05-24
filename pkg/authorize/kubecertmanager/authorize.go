@@ -20,11 +20,16 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
+	"time"
 
 	"github.com/UKHomeOffice/policy-admission/pkg/api"
 	"github.com/UKHomeOffice/policy-admission/pkg/utils"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/route53"
+	"github.com/aws/aws-sdk-go/service/route53/route53iface"
 	"github.com/patrickmn/go-cache"
 	extensions "k8s.io/api/extensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,11 +42,17 @@ type resolver interface {
 	GetCNAME(string) (string, error)
 }
 
+const cachedDomains = "domains"
+
 type authorizer struct {
 	// config the configuration for the service
 	config *Config
 	// resolve is a dns resolver
 	resolve resolver
+	// client is the route53 client
+	client route53iface.Route53API
+	// cached is a small in-memory cache
+	cached *cache.Cache
 }
 
 // Admit is responsible for authorizing the ingress for kube-cert-manager
@@ -69,8 +80,14 @@ func (c *authorizer) validateIngress(ingress *extensions.Ingress) field.ErrorLis
 		return errs
 	}
 
+	// @step: get the list of hosted domains
+	domains, err := c.hostedDomains()
+	if err != nil {
+		return append(errs, field.InternalError(field.NewPath(""), fmt.Errorf("unable to retrieve hosting domains: %s", err)))
+	}
+
 	// @check if the domain is not within the internally hosts domain
-	if hosted := c.isHosted(ingress); hosted {
+	if hosted := isHosted(ingress, domains); hosted {
 		// @check we are not trying to use a http challenge
 		return errs
 	}
@@ -103,7 +120,7 @@ func (c *authorizer) validateIngress(ingress *extensions.Ingress) field.ErrorLis
 	}
 
 	// @check the dns for the hostnames are pointing to the cname of the external ingress controller
-	pointed, err := c.isIngressPointed(ingress)
+	pointed, err := isIngressPointed(c.resolve, c.config.ExternalIngressHostname, ingress)
 	if err != nil {
 		return append(errs, field.InternalError(field.NewPath("dns validation"), fmt.Errorf("failed to check for dns validation: %s", err)))
 	}
@@ -113,33 +130,33 @@ func (c *authorizer) validateIngress(ingress *extensions.Ingress) field.ErrorLis
 	return errs
 }
 
-// isHosted checks the domain is hosted by us
-func (c *authorizer) isHosted(ingress *extensions.Ingress) bool {
-	for _, x := range ingress.Spec.Rules {
-		for _, dns := range c.config.HostedDomains {
-			if strings.HasSuffix(x.Host, dns) {
-				return true
-			}
-		}
+// hostedDomains returns a list of hosted domains
+func (c *authorizer) hostedDomains() ([]string, error) {
+	// @check is no access or secret key we default to hostdomains
+	if !c.config.IsHostingDomains() {
+		return c.config.HostedDomains, nil
 	}
 
-	return false
-}
-
-// isIngressPointed is responisble for checking the dns hostname is pointed to the external ingress
-func (c *authorizer) isIngressPointed(ingress *extensions.Ingress) (field.ErrorList, error) {
-	var errs field.ErrorList
-
-	for i, x := range ingress.Spec.Rules {
-		if cname, err := c.resolve.GetCNAME(x.Host); err != nil {
-			return errs, err
-		} else if cname != c.config.ExternalIngressHostname {
-			return append(errs, field.Invalid(field.NewPath("spec").Child("rules").Index(i).Child("host"), x.Host,
-				fmt.Sprintf("the hostname: %s is not pointed to the external ingress dns name %s", x.Host, c.config.ExternalIngressHostname))), nil
-		}
+	// @check the we don't have the value in the cache
+	list, found := c.cached.Get(cachedDomains)
+	if found {
+		return list.([]string), nil
 	}
 
-	return errs, nil
+	var domains []string
+
+	err := utils.Retry(3, 100*time.Millisecond, func() error {
+		list, err := getAWSHostedDomains(c.client)
+		if err != nil {
+			return err
+		}
+		domains = list
+		c.cached.Set(cachedDomains, domains, 10*time.Minute)
+
+		return nil
+	})
+
+	return domains, err
 }
 
 // Name is the authorizer
@@ -161,10 +178,21 @@ func New(config *Config) (api.Authorize, error) {
 		config = NewDefaultConfig()
 	}
 
-	return &authorizer{
+	svc := &authorizer{
+		cached:  cache.New(10*time.Minute, 5*time.Minute),
 		config:  config,
 		resolve: &resolverImp{},
-	}, nil
+	}
+
+	if config.IsHostingDomains() {
+		sess := session.Must(session.NewSession(&aws.Config{
+			Credentials: credentials.NewStaticCredentials(config.AccessKey, config.SecretKey, ""),
+		}))
+
+		svc.client = route53.New(sess)
+	}
+
+	return svc, nil
 }
 
 // NewFromFile reads the configuration path and returns the authorizer

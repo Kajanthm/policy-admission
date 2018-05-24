@@ -27,6 +27,7 @@ func Retry(attempts int, interval time.Duration, fn func() error) error {
 		if err := fn(); err == nil {
 			return nil
 		}
+		time.Sleep(interval)
 	}
 
 	return errors.New("operation failed")
